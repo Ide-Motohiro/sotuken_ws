@@ -1,3 +1,6 @@
+# Claude Code project instructions (local only)
+CLAUDE.md
+
 # Secrets / credentials
 .env
 .env.*
