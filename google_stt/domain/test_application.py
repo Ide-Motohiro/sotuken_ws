@@ -88,5 +88,53 @@ class TestDialogueApplicationService(unittest.TestCase):
         self.assertEqual(len(history.get_messages()), 0)
 
 
+class TestDialogueApplicationServiceTurnLogging(unittest.TestCase):
+    """on_turn による1ターンの記録。実験時に会話の脱線を後から追うために要る"""
+
+    def _run(self, texts, reply, use_stream):
+        recorded = []
+        service = DialogueApplicationService(
+            recognizer=MockSpeechRecognizer(texts),
+            model=MockLanguageModel(reply=reply),
+            tts=MockTextToSpeech(),
+            history=DialogueHistory(),
+            use_stream=use_stream,
+            on_turn=lambda user, model_reply: recorded.append((user, model_reply)),
+        )
+        service.run_once()
+        return recorded
+
+    def test_reports_user_and_reply_in_batch_mode(self):
+        self.assertEqual(self._run(["こんにちは"], "うん、いい、天気、だね", False),
+                         [("こんにちは", "うん、いい、天気、だね")])
+
+    def test_reports_user_and_reply_in_stream_mode(self):
+        """ストリーミング時もスパイジェネレータで蓄積した全文が渡ること"""
+        self.assertEqual(self._run(["こんにちは"], "うん、いい、天気、だね", True),
+                         [("こんにちは", "うん、いい、天気、だね")])
+
+    def test_reports_garbled_recognition_verbatim(self):
+        """崩れた認識結果こそ記録の対象。LLMが意味をでっち上げても入力が残る"""
+        recorded = self._run(["とんにつぃわ ぱんとお もい"], "おお、パン、牛乳、だね", False)
+        self.assertEqual(recorded[0][0], "とんにつぃわ ぱんとお もい")
+
+    def test_not_called_when_recognition_is_empty(self):
+        """認識が空のターンは対話が起きていないので通知しない"""
+        self.assertEqual(self._run([""], "応答しません", False), [])
+
+    def test_omitted_callback_is_optional(self):
+        """on_turn を渡さなくても従来通り動くこと"""
+        tts = MockTextToSpeech()
+        service = DialogueApplicationService(
+            recognizer=MockSpeechRecognizer(["こんにちは"]),
+            model=MockLanguageModel(reply="うん"),
+            tts=tts,
+            history=DialogueHistory(),
+            use_stream=False,
+        )
+        service.run_once()
+        self.assertEqual(tts.spoken_texts, ["うん"])
+
+
 if __name__ == "__main__":
     unittest.main()

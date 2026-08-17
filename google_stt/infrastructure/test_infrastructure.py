@@ -227,6 +227,38 @@ class TestPhonemeSwapTTS(unittest.TestCase):
         self.assertEqual(VoiceVoxTTS()._transform_query(copy.deepcopy(query)), query)
 
 
+class TestGeminiConfig(unittest.TestCase):
+    """generate_content に渡す設定の組み立て（APIを叩かずに検証できる部分）"""
+
+    def _model(self, **kwargs):
+        # genai.Client の生成には認証が要るので __init__ を通さずに属性だけ用意する
+        model = GeminiLanguageModel.__new__(GeminiLanguageModel)
+        model.system_instruction = kwargs.get("system_instruction")
+        model.thinking_budget = kwargs.get("thinking_budget")
+        return model
+
+    def test_omits_unset_fields(self):
+        """指定の無い項目は設定に入れない（APIの既定に委ねる）"""
+        self.assertEqual(self._model()._build_config(), {})
+
+    def test_includes_system_instruction(self):
+        config = self._model(system_instruction="test")._build_config()
+        self.assertEqual(config["system_instruction"], "test")
+        self.assertNotIn("thinking_config", config)
+
+    def test_thinking_budget_zero_is_sent(self):
+        """0 は「思考を無効化する」という明示的な指定なので、未指定と区別して送る"""
+        config = self._model(thinking_budget=0)._build_config()
+        self.assertEqual(config["thinking_config"], {"thinking_budget": 0})
+
+    def test_thinking_budget_intermediate_value(self):
+        config = self._model(thinking_budget=512)._build_config()
+        self.assertEqual(config["thinking_config"], {"thinking_budget": 512})
+
+    def test_none_thinking_budget_falls_back_to_api_default(self):
+        self.assertNotIn("thinking_config", self._model(thinking_budget=None)._build_config())
+
+
 class TestSynthesisTiming(unittest.TestCase):
     def test_time_to_first_sound_excludes_playback(self):
         """フィラーで隠すべき区間は再生を含まない（音が鳴り始めたら隠す対象ではない）"""
