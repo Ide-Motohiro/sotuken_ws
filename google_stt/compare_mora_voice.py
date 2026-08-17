@@ -61,7 +61,7 @@ def load_mora_bank(bank_dir: str) -> dict[str, tuple[np.ndarray, int]]:
     if not os.path.isdir(bank_dir):
         raise FileNotFoundError(
             f"モーラバンクが見つかりません: {bank_dir}\n"
-            "先に `python -m google_stt.build_mora_bank` を実行してください。"
+            "先にバンクを生成してください（VOICEVOX: build_mora_bank / 肉声: record_mora_bank）。"
         )
     bank = {}
     for fname in os.listdir(bank_dir):
@@ -163,15 +163,29 @@ def play(arr: np.ndarray, sr: int) -> None:
 def main():
     parser = argparse.ArgumentParser(description="モーラバンク疑似言語音の聞き比べ")
     parser.add_argument("--speaker", type=int, default=DEFAULT_SPEAKER_ID, help="VOICEVOXの話者ID（バンク生成時と合わせる）")
+    parser.add_argument("--bank", type=str, default=None, help="録音バンク名（mora_bank_<NAME>/ を読む。--speakerより優先）")
+    parser.add_argument("--text", type=str, default=SAMPLE_TEXT, help="読み上げるテキスト（欠落モーラ検証用に差し替え可）")
     args = parser.parse_args()
 
-    bank_dir = bank_dir_for_speaker(args.speaker)
+    if args.bank:
+        bank_dir = os.path.join(os.path.dirname(__file__), f"mora_bank_{args.bank}")
+    else:
+        bank_dir = bank_dir_for_speaker(args.speaker)
     bank = load_mora_bank(bank_dir)
     sr = next(iter(bank.values()))[1]
     print(f"モーラバンク読み込み完了（{bank_dir}、{len(bank)}種類、サンプルレート{sr}Hz）")
 
-    hiragana = to_hiragana_reading(SAMPLE_TEXT)
-    print(f"読み: {hiragana}\n")
+    hiragana = to_hiragana_reading(args.text)
+    print(f"読み: {hiragana}")
+
+    # バンクに無いモーラ（無音で飛ぶ）を事前に警告する
+    missing = sorted({
+        m for m in split_moras(hiragana)
+        if m not in bank and m not in PAUSE_CHARS and m not in (SOKUON, CHOON)
+    })
+    if missing:
+        print(f"⚠ バンクに無いモーラ（無音で飛びます）: {', '.join(missing)}")
+    print()
 
     rng = np.random.default_rng()
 

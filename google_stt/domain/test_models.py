@@ -5,6 +5,9 @@ from google_stt.domain.models import (
     DialogueHistory,
     FillerSequence,
     PseudoVoicePitchMapper,
+    ConsonantSubstitutionTable,
+    ARTICULATION_GROUPS,
+    CONSONANTS,
 )
 
 class TestMessage(unittest.TestCase):
@@ -141,6 +144,77 @@ class TestPseudoVoicePitchMapper(unittest.TestCase):
         self.assertIsNone(mapper.map_char_to_frequency(" "))
         self.assertIsNone(mapper.map_char_to_frequency("\n"))
         self.assertIsNone(mapper.map_char_to_frequency("　"))
+
+
+class TestConsonantSubstitutionTable(unittest.TestCase):
+    def test_articulatory_table_covers_all_consonants(self):
+        """調音グループ由来の置換表が全子音を覆い、置換先も既知の子音であること"""
+        table = ConsonantSubstitutionTable.articulatory()
+        self.assertEqual(set(table.mapping.keys()), set(CONSONANTS))
+        self.assertTrue(set(table.mapping.values()).issubset(set(CONSONANTS)))
+
+    def test_articulatory_table_stays_within_group(self):
+        """置換先が同じ調音グループ内に留まること（調音様式・有声性が保たれる）"""
+        table = ConsonantSubstitutionTable.articulatory()
+        for group in ARTICULATION_GROUPS:
+            for consonant in group:
+                self.assertIn(table.substitute(consonant), group)
+
+    def test_distant_table_covers_all_consonants(self):
+        """比較対照用の遠い置換表も全子音を覆うこと"""
+        table = ConsonantSubstitutionTable.distant()
+        self.assertEqual(set(table.mapping.keys()), set(CONSONANTS))
+        self.assertTrue(set(table.mapping.values()).issubset(set(CONSONANTS)))
+
+    def test_no_fixed_points(self):
+        """自分自身へ写る子音があると、そこだけ加工が効かず素のまま鳴ってしまう"""
+        for table in (ConsonantSubstitutionTable.articulatory(),
+                      ConsonantSubstitutionTable.distant()):
+            for src, dst in table.mapping.items():
+                self.assertNotEqual(src, dst)
+
+    def test_rejects_fixed_point_mapping(self):
+        """自分自身へ写る対応を渡したら生成時に弾くこと"""
+        with self.assertRaises(ValueError):
+            ConsonantSubstitutionTable({"k": "k"})
+
+    def test_rejects_out_of_range_ratio(self):
+        """swap_ratio が 0.0〜1.0 の外なら弾くこと"""
+        with self.assertRaises(ValueError):
+            ConsonantSubstitutionTable({"k": "t"}, swap_ratio=1.5)
+        with self.assertRaises(ValueError):
+            ConsonantSubstitutionTable({"k": "t"}, swap_ratio=-0.1)
+
+    def test_substitute_returns_none_for_unknown(self):
+        """表に無い子音は None（呼び出し側で素通しさせる）"""
+        table = ConsonantSubstitutionTable.articulatory()
+        self.assertIsNone(table.substitute("ng"))
+
+    def test_should_swap_ratio_half_selects_every_other(self):
+        """swap_ratio=0.5 は 0, 2, 4, ... 番目を選ぶ（聴取比較で採用した水準）"""
+        table = ConsonantSubstitutionTable.articulatory(swap_ratio=0.5)
+        selected = [i for i in range(10) if table.should_swap(i)]
+        self.assertEqual(selected, [0, 2, 4, 6, 8])
+
+    def test_should_swap_ratio_one_selects_all(self):
+        table = ConsonantSubstitutionTable.articulatory(swap_ratio=1.0)
+        self.assertTrue(all(table.should_swap(i) for i in range(10)))
+
+    def test_should_swap_ratio_zero_selects_none(self):
+        table = ConsonantSubstitutionTable.articulatory(swap_ratio=0.0)
+        self.assertFalse(any(table.should_swap(i) for i in range(10)))
+
+    def test_should_swap_approximates_ratio(self):
+        """中間の割合でも、選ばれる個数が指定した割合におおむね一致すること"""
+        for ratio in (0.25, 0.33, 0.67, 0.75):
+            table = ConsonantSubstitutionTable.articulatory(swap_ratio=ratio)
+            count = sum(1 for i in range(100) if table.should_swap(i))
+            self.assertAlmostEqual(count / 100, ratio, delta=0.02)
+
+    def test_should_swap_rejects_negative_index(self):
+        table = ConsonantSubstitutionTable.articulatory()
+        with self.assertRaises(ValueError):
+            table.should_swap(-1)
 
 
 if __name__ == "__main__":

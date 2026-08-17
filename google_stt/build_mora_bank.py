@@ -112,12 +112,25 @@ def trim_silence(arr: np.ndarray, threshold: float = 0.02, pad_samples: int = 40
 
 
 def normalize_duration(arr: np.ndarray, target_duration: float, sr: int) -> np.ndarray:
-    """モーラの長さを線形リサンプリングで固定長に正規化する（短い音は伸ばし、長い音は縮める）"""
+    """モーラの長さを線形リサンプリングで固定長に正規化する（短い音は伸ばし、長い音は縮める）。
+    リサンプリングするためピッチも変わる。長さが揃ったVOICEVOX音声向け。"""
     target_n = max(1, int(sr * target_duration))
     if len(arr) < 2:
         return np.zeros(target_n, dtype=np.float32)
     idx = np.linspace(0, len(arr) - 1, target_n)
     return np.interp(idx, np.arange(len(arr)), arr).astype(np.float32)
+
+
+def fit_duration_crop(arr: np.ndarray, target_duration: float, sr: int) -> np.ndarray:
+    """モーラを固定長に揃える。リサンプリングせず、頭（子音の立ち上がり）を残して
+    末尾を切り取る／不足分は無音で埋める。ピッチが保たれるので、録るたびに長さが
+    バラつく肉声向け（引き伸ばしによるピッチのヨレを防ぐ）。"""
+    target_n = max(1, int(sr * target_duration))
+    if len(arr) >= target_n:
+        return arr[:target_n].astype(np.float32)
+    out = np.zeros(target_n, dtype=np.float32)
+    out[: len(arr)] = arr
+    return out
 
 
 def apply_fade(arr: np.ndarray, fade_samples: int = 200) -> np.ndarray:

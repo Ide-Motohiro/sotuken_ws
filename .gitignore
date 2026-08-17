@@ -40,3 +40,6 @@ Thumbs.db
 # Audio temp files
 *.wav
 *.mp3
+
+#TODO
+TODO.md
