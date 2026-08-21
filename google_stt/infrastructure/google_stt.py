@@ -1,11 +1,14 @@
+import array
 import os
 import queue
+import statistics
 import threading
 import time
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 import sounddevice as sd
 from google.cloud import speech
 from google_stt.domain.interfaces import SpeechRecognizer
+from google_stt.domain.models import looks_incomplete
 
 #: 入力デバイスを指定する環境変数。`.env` に書けばコードもコマンドも触らずに切り替えられる。
 #: 値はデバイス番号（"7"）でも名前の一部（"Microphone Array"）でもよい。
@@ -23,6 +26,40 @@ def list_input_devices() -> List[Tuple[int, str]]:
         for i, device in enumerate(sd.query_devices())
         if device["max_input_channels"] > 0
     ]
+
+
+def measure_input_level(
+    index: Optional[int], seconds: float = 5.0, sample_rate: int = 16000,
+    chunk_size: int = 1600, on_tick: Optional[Callable[[float], None]] = None,
+) -> Tuple[int, float, float]:
+    """指定デバイスから一定時間録音し、(ブロック数, RMSの中央値, RMSの最大) を返す。
+
+    マイクの選択を間違えると recognize_once() が例外も出さずに返ってこないだけなので、
+    対話を回す前にここで切り分ける。音は保存しない（音量だけ見る）。
+
+    on_tick は残り秒数を毎秒渡す。カウントダウンの表示に使う。
+    """
+    levels: List[float] = []
+
+    def callback(indata, _frames, _timestamp, _status):
+        samples = array.array("h")
+        samples.frombytes(bytes(indata))
+        if samples:
+            levels.append((sum(float(v) * v for v in samples) / len(samples)) ** 0.5)
+
+    with sd.InputStream(samplerate=sample_rate, channels=1, dtype="int16",
+                        blocksize=chunk_size, callback=callback, device=index):
+        remaining = seconds
+        while remaining > 0:
+            if on_tick is not None:
+                on_tick(remaining)
+            step = min(1.0, remaining)
+            time.sleep(step)
+            remaining -= step
+
+    if not levels:
+        return 0, 0.0, 0.0
+    return len(levels), statistics.median(levels), max(levels)
 
 
 def resolve_input_device(device: Optional[Union[int, str]]) -> Optional[int]:
@@ -93,13 +130,24 @@ class GoogleSpeechRecognizer(SpeechRecognizer):
         sample_rate: int = 16000,
         chunk_size: int = 1600,
         stability_duration: float = 0.4,
+        continuation_duration: float = 1.0,
         is_speaking_fn = lambda: False,
         device: Optional[Union[int, str]] = None,
         announce_device: bool = True,
     ) -> None:
         self.sample_rate: int = sample_rate
         self.chunk_size: int = chunk_size
+        #: 中間結果がこの秒数変化しなければ発話終端とみなす。
+        #: **ここはフィラーが鳴り始める前の区間**なので、伸ばすと隠せない無音がそのまま増える。
         self.stability_duration: float = stability_duration
+        #: まだ続きそうな終わり方（助詞・接続助詞・言いよどみ）のときに使う長い方の待ち。
+        #: 日本語の発話中の休止は文節末に集中するため、そこだけ待てば
+        #: テンポを保ったまま途中で切られるのを減らせる。
+        if continuation_duration < stability_duration:
+            raise ValueError(
+                f"continuation_duration ({continuation_duration}) は "
+                f"stability_duration ({stability_duration}) 以上にすること")
+        self.continuation_duration: float = continuation_duration
         self.is_speaking_fn = is_speaking_fn
         self.audio_queue: queue.Queue = queue.Queue()
 
@@ -126,12 +174,24 @@ class GoogleSpeechRecognizer(SpeechRecognizer):
             interim_results=True,
         )
 
+    def required_stability(self, transcript: str) -> float:
+        """この中間結果を確定させるまでに必要な無変化時間を返す。
+
+        まだ続きそうな終わり方なら長い方を使う。判定を誤って長い方に倒れても、
+        損は待ち時間だけで発話が壊れることはない。
+        """
+        return self.continuation_duration if looks_incomplete(transcript) else self.stability_duration
+
     def _callback(self, indata, _frames, _timestamp, _status):
         if not self.is_speaking_fn():
             self.audio_queue.put(bytes(indata))
 
     def recognize_once(self) -> str:
-        """マイク入力を開始し、発話が確定（stability_durationの間変化なし）するまでブロックして文字列を返す"""
+        """マイク入力を開始し、発話が確定するまでブロックして文字列を返す。
+
+        確定条件は「中間結果が一定時間変化しないこと」。必要な時間は終わり方で変わり、
+        まだ続きそうなら continuation_duration、そうでなければ stability_duration。
+        """
         # 前の発話で残った古いキューをクリア
         while not self.audio_queue.empty():
             try:
@@ -142,6 +202,10 @@ class GoogleSpeechRecognizer(SpeechRecognizer):
         stop_streaming = threading.Event()
         last_interim = ""
         stable_since = 0.0
+        # 今回の発話ぶんの計測値。取れなかった経路では None のまま残る
+        self.last_endpoint_wait_sec = None
+        self.last_confidence = None
+        self.last_finalized_by_service = None
 
         def generate_requests():
             while not stop_streaming.is_set():
@@ -158,17 +222,38 @@ class GoogleSpeechRecognizer(SpeechRecognizer):
             responses = self._stt_client.streaming_recognize(self._streaming_config, generate_requests())
             for response in responses:
                 for result in response.results:
-                    transcript = result.alternatives[0].transcript
+                    alternative = result.alternatives[0]
+                    transcript = alternative.transcript
+                    now = time.monotonic()
                     if result.is_final:
+                        # 認識サービス側が確定と判断した経路。信頼度はここにしか入らない
+                        self._record_endpoint(now, stable_since, alternative, by_service=True)
                         stop_streaming.set()
                         return transcript
-                    
-                    now = time.monotonic()
+
                     if transcript != last_interim:
                         last_interim = transcript
                         stable_since = now
-                    elif transcript and (now - stable_since) >= self.stability_duration:
+                    elif transcript and (now - stable_since) >= self.required_stability(transcript):
+                        # 中間結果が変化しなくなった経路。本システムでは主にこちらが効く
+                        self._record_endpoint(now, stable_since, alternative, by_service=False)
                         stop_streaming.set()
                         return transcript
                     print(f"\r途中: {transcript}", end="", flush=True)
         return ""
+
+    def _record_endpoint(self, now: float, stable_since: float, alternative,
+                         by_service: bool) -> None:
+        """発話終端を検出したときの計測値を残す。
+
+        `last_endpoint_wait_sec` の起点は「中間結果が変化しなくなった時刻」であって、
+        ユーザーが口を閉じた時刻ではない。中間結果は音声から遅れて届くため、
+        実際の無音はこの値より長い（その遅れは未計測）。
+
+        信頼度は Google STT が最終結果にしか入れないと考えられるため、
+        interim 経路では 0.0 のまま返ることを想定している。判定できるよう
+        生の値をそのまま残す（`by_service` でどちらの経路だったかが分かる）。
+        """
+        self.last_endpoint_wait_sec = (now - stable_since) if stable_since else None
+        self.last_confidence = getattr(alternative, "confidence", None)
+        self.last_finalized_by_service = by_service

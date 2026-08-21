@@ -1,12 +1,15 @@
 import unittest
 import copy
 import os
+import time
+from unittest import mock
 import requests
 import sounddevice as sd
 from google_stt.domain.models import (
     ConsonantSubstitutionTable, DialogueHistory, FillerSequence, PseudoVoicePitchMapper,
 )
 from google_stt.infrastructure.phoneme_swap import PhonemeSwapTTS, substitute_consonants
+from google_stt.infrastructure.filler import VoiceVoxFillerPlayer
 from google_stt.infrastructure.gemini import GeminiLanguageModel
 from google_stt.infrastructure.voicevox import SynthesisTiming, VoiceVoxTTS
 from google_stt.infrastructure.pseudo_voice import PseudoVoiceTTS
@@ -328,6 +331,152 @@ class TestVoiceVoxTimingIntegration(unittest.TestCase):
         tts = VoiceVoxTTS()
         tts.speak("   ")
         self.assertIsNone(tts.last_timing)
+
+
+class TestVoiceVoxFillerPlayerSelection(unittest.TestCase):
+    """フィラーの選択規則。連続するターンで同じ音が鳴らないことが要件"""
+
+    @unittest.skipUnless(is_voicevox_running(), "VOICEVOX server is not running")
+    def test_never_repeats_the_previous_phrase(self):
+        player = VoiceVoxFillerPlayer(VoiceVoxTTS(), phrases=("ん", "え", "あ"), seed=0)
+        try:
+            picks = [player._next_path() for _ in range(60)]
+        finally:
+            player.close()
+        for previous, current in zip(picks, picks[1:]):
+            self.assertNotEqual(previous, current)
+
+    @unittest.skipUnless(is_voicevox_running(), "VOICEVOX server is not running")
+    def test_seed_makes_the_order_reproducible(self):
+        """デバッグ時に同じ並びを再現できること（実験の再現性のためではない）"""
+        def picks(seed):
+            player = VoiceVoxFillerPlayer(VoiceVoxTTS(), phrases=("ん", "え", "あ"), seed=seed)
+            try:
+                return [player.phrases[player._last_index]
+                        for _ in range(20) if player._next_path() or True]
+            finally:
+                player.close()
+        self.assertEqual(picks(7), picks(7))
+
+    @unittest.skipUnless(is_voicevox_running(), "VOICEVOX server is not running")
+    def test_single_phrase_does_not_deadlock(self):
+        """語句が1つしかない場合、候補が空になっても選べること"""
+        player = VoiceVoxFillerPlayer(VoiceVoxTTS(), phrases=("ん",), seed=0)
+        try:
+            self.assertEqual(len({player._next_path() for _ in range(5)}), 1)
+        finally:
+            player.close()
+
+    def test_rejects_empty_phrases(self):
+        with self.assertRaises(ValueError):
+            VoiceVoxFillerPlayer(VoiceVoxTTS(), phrases=())
+
+    def test_rejects_negative_initial_delay(self):
+        with self.assertRaises(ValueError):
+            VoiceVoxFillerPlayer(VoiceVoxTTS(), phrases=("ん",), initial_delay_sec=-0.1)
+
+
+class TestVoiceVoxFillerPlayerTiming(unittest.TestCase):
+    """立ち上がりの遅延。認識確定と同時に鳴らすと食い気味に聞こえるため置いている。
+
+    実際に音を鳴らすと待ち時間が読めないので、再生だけ差し替えて呼ばれた時刻を見る。
+    """
+
+    @unittest.skipUnless(is_voicevox_running(), "VOICEVOX server is not running")
+    def test_does_not_sound_during_the_initial_delay(self):
+        """遅延中に止められたら一度も鳴らさないこと"""
+        player = VoiceVoxFillerPlayer(
+            VoiceVoxTTS(), phrases=("ん",), initial_delay_sec=5.0, seed=0)
+        try:
+            with mock.patch("google_stt.infrastructure.filler.winsound.PlaySound") as play:
+                player.start()
+                time.sleep(0.1)
+                player.stop()
+                play.assert_not_called()
+            # 鳴っていないので停止は待たされない
+            self.assertLess(player.last_stop_delay_sec, 0.5)
+        finally:
+            player.close()
+
+    @unittest.skipUnless(is_voicevox_running(), "VOICEVOX server is not running")
+    def test_sounds_after_the_initial_delay(self):
+        """遅延が明けたら鳴ること。鳴り始めが遅延より前でないこと"""
+        delay = 0.2
+        elapsed = []
+        player = VoiceVoxFillerPlayer(
+            VoiceVoxTTS(), phrases=("ん",), initial_delay_sec=delay, seed=0)
+        try:
+            with mock.patch("google_stt.infrastructure.filler.winsound.PlaySound",
+                            side_effect=lambda *a, **k: elapsed.append(
+                                time.perf_counter() - started)):
+                started = time.perf_counter()
+                player.start()
+                time.sleep(delay + 0.3)
+                player.stop()
+        finally:
+            player.close()
+        self.assertTrue(elapsed, "遅延が明けても鳴らなかった")
+        self.assertGreaterEqual(elapsed[0], delay)
+
+    @unittest.skipUnless(is_voicevox_running(), "VOICEVOX server is not running")
+    def test_zero_delay_sounds_immediately(self):
+        """0 を渡せば従来どおり即座に鳴ること（比較条件を作れるようにしておく）"""
+        elapsed = []
+        player = VoiceVoxFillerPlayer(
+            VoiceVoxTTS(), phrases=("ん",), initial_delay_sec=0.0, seed=0)
+        try:
+            with mock.patch("google_stt.infrastructure.filler.winsound.PlaySound",
+                            side_effect=lambda *a, **k: elapsed.append(
+                                time.perf_counter() - started)):
+                started = time.perf_counter()
+                player.start()
+                time.sleep(0.2)
+                player.stop()
+        finally:
+            player.close()
+        self.assertTrue(elapsed, "即座に鳴るはずが鳴らなかった")
+        self.assertLess(elapsed[0], 0.1)
+
+
+class TestEndpointStability(unittest.TestCase):
+    """終端判定の待ち時間の切り替え。発話の途中で確定されると会話が壊れるので、
+    まだ続きそうな終わり方では長く待つ"""
+
+    def _recognizer(self, short=0.4, long=1.0):
+        # SpeechClient を作らずに判定だけを試すため、__init__ を通さずに組み立てる
+        recognizer = GoogleSpeechRecognizer.__new__(GoogleSpeechRecognizer)
+        recognizer.stability_duration = short
+        recognizer.continuation_duration = long
+        return recognizer
+
+    def test_complete_utterance_uses_the_short_wait(self):
+        recognizer = self._recognizer()
+        for text in ("今日はいい天気だね", "ラーメンが好き", "これ食べていい？",
+                     # 「もう」を継続語に入れると意志形（読もう）を巻き込むので入れていない
+                     "本読もう", "本読むのってやっぱおもしろいよな"):
+            with self.subTest(text=text):
+                self.assertEqual(recognizer.required_stability(text), 0.4)
+
+    def test_continuing_utterance_uses_the_long_wait(self):
+        recognizer = self._recognizer()
+        for text in ("映画を見たんだけど", "私は", "昨日ね、映画を", "えーと",
+                     # 実対話で「本読むのってやっぱ」で切られた。副詞は後ろに述語が要る
+                     "本読むのってやっぱ", "たぶん", "こんな"):
+            with self.subTest(text=text):
+                self.assertEqual(recognizer.required_stability(text), 1.0)
+
+    def test_empty_transcript_uses_the_short_wait(self):
+        """空文字は「続きそう」と判定しない（判定が真だと待ちだけ伸びる）"""
+        self.assertEqual(self._recognizer().required_stability(""), 0.4)
+
+    def test_rejects_continuation_shorter_than_stability(self):
+        """長い方が短い方を下回る設定は受け付けないこと。
+
+        検証は SpeechClient を作る前に走るので、認証情報が無くても実行できる。
+        """
+        with self.assertRaises(ValueError):
+            GoogleSpeechRecognizer(stability_duration=0.8, continuation_duration=0.4,
+                                   announce_device=False)
 
 
 class TestInputDeviceResolution(unittest.TestCase):

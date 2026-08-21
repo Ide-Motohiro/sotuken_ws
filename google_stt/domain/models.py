@@ -1,5 +1,6 @@
+from dataclasses import dataclass
 from enum import Enum
-from typing import List, Dict, Any, Optional
+from typing import Tuple, List, Dict, Any, Optional
 
 class Role(Enum):
     USER = "user"
@@ -95,6 +96,77 @@ ARTICULATION_GROUPS: List[List[str]] = [
 CONSONANTS: List[str] = [c for group in ARTICULATION_GROUPS for c in group]
 
 
+
+
+@dataclass(frozen=True)
+class TurnTiming:
+    """1ターンの時間の内訳（秒）。ユーザーが喋り終わってから応答の音が出るまでを分解する。
+
+    体感リアルタイム性が本研究の従属変数そのものなので、**本番の経路の中で測れること**が要る。
+    区間ごとの測定はそれぞれの実装（認識器・モデル・TTS）が持ち、ここではそれを束ねるだけ。
+    測っていない区間は None のまま入る。
+
+    **`endpoint_wait_sec` の起点は「中間認識結果が変化しなくなった時刻」であり、
+    ユーザーが実際に口を閉じた時刻ではない。** 認識サービスの中間結果は音声から遅れて届くため、
+    その遅れ（未計測）の分だけ実際の無音はここに現れる値より長い。論文で述べるときは
+    この留保を落とさないこと。
+    """
+    endpoint_wait_sec: Optional[float] = None
+    generation_sec: Optional[float] = None
+    time_to_first_sound_sec: Optional[float] = None
+    playback_sec: Optional[float] = None
+    #: フィラーを鳴らし終わるまで応答を待たせた秒数（フィラー無し条件では None）
+    filler_stop_delay_sec: Optional[float] = None
+
+    @property
+    def time_to_response_sec(self) -> Optional[float]:
+        """発話終端の検出から応答の音が鳴り始めるまで。欠けている区間があれば None。
+
+        フィラーあり条件ではこの区間の一部にフィラーが鳴るので、全部が無音とは限らない。
+        """
+        parts = (self.endpoint_wait_sec, self.generation_sec, self.time_to_first_sound_sec)
+        if any(part is None for part in parts):
+            return None
+        return sum(parts) + (self.filler_stop_delay_sec or 0.0)
+
+
+#: これで終わっている発話は、まだ続きがあると見なす語尾。
+#:
+#: 日本語の発話中の休止は文節末（助詞・接続助詞の直後）に集中する。
+#: 「えーと、昨日ね……映画を見たんだけど」の「ね」のあとで切られると発話が途中で確定してしまう。
+#: 意味を解釈するのではなく、**語の終わり方だけ**を見る単純な規則にしてある
+#: （解釈を挟むと条件間で挙動がぶれるうえ、認識結果は句読点を持たないため当てにならない）。
+#:
+#: 長い方の待ちに倒れても損は待ち時間だけなので、迷ったら入れる方針で選んである。
+CONTINUATION_ENDINGS: Tuple[str, ...] = (
+    # 接続助詞（前件と後件をつなぐので、後件がまだ来ていない）
+    "て", "で", "けど", "けれど", "けれども", "が", "し", "から", "ので", "のに",
+    "たら", "なら", "ば", "とか", "って", "という",
+    # 格助詞・係助詞（体言に付くので、述語がまだ来ていない）
+    "は", "も", "を", "に", "へ", "と", "の", "や",
+    # 言いよどみ（次の語を探している最中）
+    "えーと", "えっと", "ええと", "あの", "あのー", "その", "まあ", "なんか",
+    # 述語を要求する副詞（後ろに来る述語がまだ来ていない）
+    # 「本読むのってやっぱ……おもしろいよな」の「やっぱ」で切られた実例から追加した
+    "やっぱ", "やっぱり", "たぶん", "きっと", "すごく", "めっちゃ", "あんまり",
+    "かなり", "けっこう", "結構", "たしか", "なんとなく",
+    # 連体詞（後ろに来る体言がまだ来ていない）
+    "こんな", "そんな", "あんな", "どんな",
+)
+
+
+def looks_incomplete(text: str) -> bool:
+    """発話がまだ続きそうかを、末尾の表現だけから判定する。
+
+    音声認識の中間結果は句読点を持たないため、文の完結は語尾でしか見分けられない。
+    真なら終端判定の待ちを長い方に切り替える。
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return stripped.endswith(CONTINUATION_ENDINGS)
+
+
 class ConsonantSubstitutionTable:
     """子音を別の子音へ写す固定置換表と、どのモーラを差し替えるかの規則を持つ値オブジェクト。
 
@@ -109,7 +181,7 @@ class ConsonantSubstitutionTable:
     入力テキストの内容では分岐せず、同じ文なら常に同じ結果になる。
     """
 
-    def __init__(self, mapping: Dict[str, str], swap_ratio: float = 0.5) -> None:
+    def __init__(self, mapping: Dict[str, str], swap_ratio: float = 0.67) -> None:
         if not 0.0 <= swap_ratio <= 1.0:
             raise ValueError(f"swap_ratio は 0.0〜1.0 で指定してください: {swap_ratio}")
         fixed_points = sorted(src for src, dst in mapping.items() if src == dst)
@@ -120,11 +192,11 @@ class ConsonantSubstitutionTable:
         self.swap_ratio: float = swap_ratio
 
     @classmethod
-    def articulatory(cls, swap_ratio: float = 0.5) -> "ConsonantSubstitutionTable":
+    def articulatory(cls, swap_ratio: float = 0.67) -> "ConsonantSubstitutionTable":
         """調音様式・有声性を保ったまま調音点だけを変える置換表（k→t、n→m など）。
 
         「別の言語」ではなく「滑舌が悪い」側に寄るため、意味を壊しつつ聞き疲れしにくい。
-        聴取比較では swap_ratio=0.5 との組み合わせが最も手応えがあった。
+        実対話での聴取で swap_ratio=0.67 を選んだ。0.5 は分かりやすすぎて「わかりそうでわからない」にならなかった（詳細は DECISIONS.md）。
         """
         mapping = {}
         for group in ARTICULATION_GROUPS:

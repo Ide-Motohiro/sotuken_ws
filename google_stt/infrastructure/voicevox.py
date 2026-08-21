@@ -44,6 +44,7 @@ class VoiceVoxTTS(TextToSpeech):
         url: str = "http://127.0.0.1:50021",
         speaker_id: int = 3,
         on_timing: Optional[Callable[[SynthesisTiming], None]] = None,
+        on_before_playback: Optional[Callable[[], None]] = None,
     ) -> None:
         self.url: str = url
         self.speaker_id: int = speaker_id
@@ -52,6 +53,10 @@ class VoiceVoxTTS(TextToSpeech):
         self.last_timing: Optional[SynthesisTiming] = None
         #: 発話ごとに時間内訳を受け取るコールバック（省略可）
         self.on_timing: Optional[Callable[[SynthesisTiming], None]] = on_timing
+        #: 合成が終わり再生が始まる直前に呼ばれるコールバック（省略可）。
+        #: 待機中のフィラーを止める位置がここ。応答テキストが返った時点で止めると
+        #: 合成の約1.1秒がまるごと無音になる。
+        self.on_before_playback: Optional[Callable[[], None]] = on_before_playback
 
     def _transform_query(self, query: Dict[str, Any]) -> Dict[str, Any]:
         """合成前に audio_query を加工する拡張点。既定では何もしない。
@@ -66,7 +71,7 @@ class VoiceVoxTTS(TextToSpeech):
 
         戻り値は (wavバイト列, audio_queryにかかった秒, synthesisにかかった秒)。
         再生と分けてあるのは、体感レイテンシの測定と、待機中のフィラーを
-        「再生が始まる直前」で止めるため（フィラー機構は TODO.md 項目4）。
+        「再生が始まる直前」で止めるため（フィラー機構は DECISIONS.md の「フィラー挿入機構」）。
 
         `is_speaking` はここでは触らない。単体で呼ぶ場合は呼び出し側が管理すること。
         """
@@ -108,6 +113,9 @@ class VoiceVoxTTS(TextToSpeech):
 
     def _record_timing(self, timing: SynthesisTiming) -> None:
         self.last_timing = timing
+        # インターフェース側の共通項目にも写す（アプリケーション層はこちらを見る）
+        self.last_time_to_first_sound_sec = timing.time_to_first_sound_sec
+        self.last_playback_sec = timing.playback_sec
         if self.on_timing is not None:
             self.on_timing(timing)
 
@@ -118,6 +126,8 @@ class VoiceVoxTTS(TextToSpeech):
         self.is_speaking = True
         try:
             wav_bytes, query_sec, synthesis_sec = self.synthesize(text)
+            if self.on_before_playback is not None:
+                self.on_before_playback()
             playback_sec = self.play(wav_bytes)
         finally:
             self.is_speaking = False

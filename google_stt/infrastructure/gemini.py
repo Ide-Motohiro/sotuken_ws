@@ -1,3 +1,4 @@
+import time
 from typing import Any, Dict, Iterator, Optional
 from google import genai
 from google_stt.domain.interfaces import LanguageModel
@@ -21,7 +22,7 @@ class GeminiLanguageModel(LanguageModel):
             短い応答を求めるプロンプトで p50 3298ms、思考を切ると p50 579ms（約5.7倍）。
             疑似言語音では語彙が聞き手に届かないため内容の精度が効きにくい一方、
             レイテンシは研究の従属変数そのものなので、その用途では 0 が適する
-            （詳細と留保は TODO.md の項目1参照）。素の音声合成を使う場合は内容が
+            （詳細と留保は DECISIONS.md の「Gemini の thinking」参照）。素の音声合成を使う場合は内容が
             そのまま届くため、既定のままにしておくこと。
         """
         self.project_id: str = project_id
@@ -29,6 +30,9 @@ class GeminiLanguageModel(LanguageModel):
         self.model_name: str = model_name
         self.system_instruction: Optional[str] = system_instruction
         self.thinking_budget: Optional[int] = thinking_budget
+        #: 直近の生成にかかった秒数。一括は応答が返るまで、ストリーミングは
+        #: 最初の断片が届くまで（体感に効くのはそこなので）。
+        self.last_generation_sec: Optional[float] = None
         self._client = genai.Client(
             vertexai=True,
             project=self.project_id,
@@ -45,14 +49,18 @@ class GeminiLanguageModel(LanguageModel):
         return config
 
     def generate_reply(self, history: DialogueHistory) -> str:
+        started = time.perf_counter()
         response = self._client.models.generate_content(
             model=self.model_name,
             contents=history.to_gemini_contents(),
             config=self._build_config()
         )
+        self.last_generation_sec = time.perf_counter() - started
         return response.text.strip() if response.text else ""
 
     def generate_reply_stream(self, history: DialogueHistory) -> Iterator[str]:
+        started = time.perf_counter()
+        self.last_generation_sec = None
         stream = self._client.models.generate_content_stream(
             model=self.model_name,
             contents=history.to_gemini_contents(),
@@ -60,5 +68,8 @@ class GeminiLanguageModel(LanguageModel):
         )
         for chunk in stream:
             if chunk.text:
+                # 最初の断片が届いた時点を記録する（そこから音を出し始められるため）
+                if self.last_generation_sec is None:
+                    self.last_generation_sec = time.perf_counter() - started
                 for char in chunk.text:
                     yield char

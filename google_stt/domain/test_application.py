@@ -4,6 +4,7 @@ from google_stt.domain.mocks import (
     MockSpeechRecognizer,
     MockLanguageModel,
     MockTextToSpeech,
+    MockFillerPlayer,
 )
 from google_stt.domain.application import DialogueApplicationService
 
@@ -135,6 +136,163 @@ class TestDialogueApplicationServiceTurnLogging(unittest.TestCase):
         service.run_once()
         self.assertEqual(tts.spoken_texts, ["うん"])
 
+
+
+class RecordingTextToSpeech(MockTextToSpeech):
+    """合成と再生を分けて記録するTTS。フィラーの停止位置を検証するために使う"""
+    def __init__(self, events, filler=None):
+        super().__init__()
+        self.events = events
+        self.filler = filler
+
+    def speak(self, text: str) -> None:
+        self.events.append("synthesize")
+        # 本番の VoiceVoxTTS は合成後・再生前に on_before_playback を呼ぶ
+        if self.filler is not None:
+            self.filler.stop()
+        self.events.append("play")
+        self.spoken_texts.append(text)
+
+
+class TestDialogueApplicationServiceTiming(unittest.TestCase):
+    """区間ごとの計測値を1ターンぶんに束ねること。
+
+    区間の境目を知っているのは各実装なので、アプリケーション層では測り直さず集めるだけ。
+    測っていない実装では None のまま残ること（欠測と0秒を混同しない）も要件。
+    """
+
+    def _service(self, filler=None):
+        recognizer = MockSpeechRecognizer(["こんにちは"])
+        model = MockLanguageModel(reply="うん")
+        tts = MockTextToSpeech()
+        return DialogueApplicationService(
+            recognizer=recognizer, model=model, tts=tts,
+            history=DialogueHistory(), use_stream=False, filler=filler,
+        ), recognizer, model, tts
+
+    def test_collects_each_measured_section(self):
+        service, recognizer, model, tts = self._service()
+        recognizer.last_endpoint_wait_sec = 0.4
+        model.last_generation_sec = 0.5
+        tts.last_time_to_first_sound_sec = 0.7
+        tts.last_playback_sec = 2.0
+
+        service.run_once()
+
+        timing = service.last_turn_timing
+        self.assertEqual(timing.endpoint_wait_sec, 0.4)
+        self.assertEqual(timing.generation_sec, 0.5)
+        self.assertEqual(timing.time_to_first_sound_sec, 0.7)
+        self.assertEqual(timing.playback_sec, 2.0)
+        self.assertAlmostEqual(timing.time_to_response_sec, 1.6)
+
+    def test_unmeasured_sections_stay_none(self):
+        """計測しない実装では None のまま。0秒として扱わないこと"""
+        service, _, _, _ = self._service()
+        service.run_once()
+        timing = service.last_turn_timing
+        self.assertIsNone(timing.endpoint_wait_sec)
+        self.assertIsNone(timing.time_to_response_sec)
+
+    def test_filler_delay_is_added_to_the_response_delay(self):
+        """フィラーを鳴らし終わるまで待った分も応答までの時間に含めること"""
+        filler = MockFillerPlayer()
+        filler.last_stop_delay_sec = 0.3
+        service, recognizer, model, tts = self._service(filler=filler)
+        recognizer.last_endpoint_wait_sec = 0.4
+        model.last_generation_sec = 0.5
+        tts.last_time_to_first_sound_sec = 0.7
+
+        service.run_once()
+
+        self.assertEqual(service.last_turn_timing.filler_stop_delay_sec, 0.3)
+        self.assertAlmostEqual(service.last_turn_timing.time_to_response_sec, 1.9)
+
+    def test_no_filler_leaves_the_delay_none(self):
+        """フィラー無し条件では null。0秒（待たなかった）と区別する"""
+        service, _, _, _ = self._service()
+        service.run_once()
+        self.assertIsNone(service.last_turn_timing.filler_stop_delay_sec)
+
+    def test_timing_is_available_when_the_callback_runs(self):
+        """on_turn の時点で計測値が入っていること（ログ側がここを読むため）"""
+        seen = []
+        service, recognizer, model, tts = self._service()
+        recognizer.last_endpoint_wait_sec = 0.4
+        model.last_generation_sec = 0.5
+        tts.last_time_to_first_sound_sec = 0.7
+        service.on_turn = lambda user, reply: seen.append(
+            service.last_turn_timing.time_to_response_sec)
+
+        service.run_once()
+
+        self.assertEqual(len(seen), 1)
+        self.assertAlmostEqual(seen[0], 1.6)
+
+
+class TestDialogueApplicationServiceFiller(unittest.TestCase):
+    """フィラーの開始・停止のタイミング。これが実験の独立変数そのものなので順序が要"""
+
+    def _service(self, filler, tts, texts=("こんにちは",)):
+        return DialogueApplicationService(
+            recognizer=MockSpeechRecognizer(list(texts)),
+            model=MockLanguageModel(reply="うん、いい、天気、だね"),
+            tts=tts,
+            history=DialogueHistory(),
+            use_stream=False,
+            filler=filler,
+        )
+
+    def test_starts_before_generation_and_stops_before_playback(self):
+        """停止は合成の後・再生の前。応答テキストが返った時点で止めると合成中が無音になる"""
+        events = []
+        filler = MockFillerPlayer()
+        # フィラーの start/stop も同じ列に混ぜて順序を見る
+        filler.events = events
+        tts = RecordingTextToSpeech(events, filler=filler)
+        self._service(filler, tts).run_once()
+
+        self.assertEqual(events, ["start", "synthesize", "stop", "play"])
+
+    def test_stopped_even_if_generation_fails(self):
+        """例外時もフィラーが鳴りっぱなしにならないこと"""
+        filler = MockFillerPlayer()
+
+        class FailingModel(MockLanguageModel):
+            def generate_reply(self, history):
+                raise RuntimeError("生成に失敗")
+
+        service = DialogueApplicationService(
+            recognizer=MockSpeechRecognizer(["こんにちは"]),
+            model=FailingModel(),
+            tts=MockTextToSpeech(),
+            history=DialogueHistory(),
+            use_stream=False,
+            filler=filler,
+        )
+        with self.assertRaises(RuntimeError):
+            service.run_once()
+        self.assertEqual(filler.events, ["start", "stop"])
+
+    def test_not_started_when_recognition_is_empty(self):
+        """発話が無ければ待機も無いので鳴らさない"""
+        filler = MockFillerPlayer()
+        self._service(filler, MockTextToSpeech(), texts=[""]).run_once()
+        self.assertEqual(filler.events, [])
+
+    def test_runs_without_filler(self):
+        """フィラー無し条件（filler=None）でも通常どおり動くこと"""
+        tts = MockTextToSpeech()
+        self._service(None, tts).run_once()
+        self.assertEqual(tts.spoken_texts, ["うん、いい、天気、だね"])
+
+    def test_stop_is_idempotent(self):
+        """TTSのフックと finally の両方から呼ばれるため冪等である必要がある"""
+        filler = MockFillerPlayer()
+        filler.start()
+        filler.stop()
+        filler.stop()
+        self.assertEqual(filler.events, ["start", "stop"])
 
 if __name__ == "__main__":
     unittest.main()

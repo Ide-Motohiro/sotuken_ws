@@ -1,5 +1,7 @@
 from typing import List, Iterator
-from google_stt.domain.interfaces import SpeechRecognizer, LanguageModel, TextToSpeech
+from google_stt.domain.interfaces import (
+    SpeechRecognizer, LanguageModel, TextToSpeech, FillerPlayer
+)
 from google_stt.domain.models import DialogueHistory
 
 class MockSpeechRecognizer(SpeechRecognizer):
@@ -42,3 +44,27 @@ class MockTextToSpeech(TextToSpeech):
         # ストリームのテキストを全て結合して記録する
         full_text = "".join(text_stream)
         self.spoken_texts.append(full_text)
+
+
+class MockFillerPlayer(FillerPlayer):
+    """フィラー再生のテスト用モック。呼び出し順を記録する。
+
+    events は外から差し替えられる（TTSの合成・再生と同じ列に混ぜて順序を検証するため）。
+    冪等性は本実装と同じく内部状態で判定する。イベント列から推測すると、間に別の
+    イベントが挟まったときに二重記録される。
+    """
+    def __init__(self) -> None:
+        self.events: List[str] = []
+        self._running: bool = False
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self.events.append("start")
+
+    def stop(self) -> None:
+        if not self._running:
+            return
+        self._running = False
+        self.events.append("stop")

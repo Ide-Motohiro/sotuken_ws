@@ -1,5 +1,6 @@
 import unittest
 from google_stt.domain.models import (
+    TurnTiming,
     Role,
     Message,
     DialogueHistory,
@@ -215,6 +216,33 @@ class TestConsonantSubstitutionTable(unittest.TestCase):
         table = ConsonantSubstitutionTable.articulatory()
         with self.assertRaises(ValueError):
             table.should_swap(-1)
+
+
+
+class TestTurnTiming(unittest.TestCase):
+    """1ターンの時間の内訳。欠測を0秒と混同しないことが要件"""
+
+    def test_sums_the_measured_sections(self):
+        timing = TurnTiming(endpoint_wait_sec=0.4, generation_sec=0.5,
+                            time_to_first_sound_sec=0.7, playback_sec=2.0)
+        self.assertAlmostEqual(timing.time_to_response_sec, 1.6)
+
+    def test_adds_the_filler_delay(self):
+        timing = TurnTiming(endpoint_wait_sec=0.4, generation_sec=0.5,
+                            time_to_first_sound_sec=0.7, filler_stop_delay_sec=0.3)
+        self.assertAlmostEqual(timing.time_to_response_sec, 1.9)
+
+    def test_missing_filler_delay_counts_as_zero(self):
+        """フィラー無し条件（None）は待ちが無かったものとして扱う"""
+        timing = TurnTiming(endpoint_wait_sec=0.4, generation_sec=0.5,
+                            time_to_first_sound_sec=0.7)
+        self.assertAlmostEqual(timing.time_to_response_sec, 1.6)
+
+    def test_missing_section_makes_the_total_none(self):
+        """区間が1つでも欠けたら合計を出さない。足りない値を0で埋めると過小評価になる"""
+        self.assertIsNone(
+            TurnTiming(generation_sec=0.5, time_to_first_sound_sec=0.7).time_to_response_sec)
+        self.assertIsNone(TurnTiming().time_to_response_sec)
 
 
 if __name__ == "__main__":

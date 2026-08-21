@@ -11,6 +11,8 @@ google_stt/gen-lang-client-*.json
 
 # Logs
 *.log
+# 対話ログ（本人の発話がそのまま残るのでリポジトリに入れない）
+logs/
 
 # Personal work logs (not for repo)
 chat_history.md

@@ -76,7 +76,7 @@ SAMPLES = [
      "そろそろお昼の時間だし、何か作って食べた方がいいと思うよ"),
 ]
 
-DEFAULT_RATIOS = [1.0, 0.5]
+DEFAULT_RATIOS = [1.0, 0.67]
 PAUSE_SEC = 0.7
 
 
@@ -230,7 +230,7 @@ def run(url: str, speaker_id: int, should_play: bool, ratios: list[float]) -> No
     print("  ・broken_* と full_* は文脈が同じなので、発話長だけの差を直接比べられる")
     print()
     print("良かった差し替え率は本線にそのまま渡せる:")
-    print("  python -m google_stt.main_phoneme_swap --swap-ratio 0.5")
+    print("  python -m google_stt.main_phoneme_swap --swap-ratio 0.67")
     if not should_play:
         print("\n（--no-play のため再生はしていない）")
 
