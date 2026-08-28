@@ -181,7 +181,7 @@ class ConsonantSubstitutionTable:
     入力テキストの内容では分岐せず、同じ文なら常に同じ結果になる。
     """
 
-    def __init__(self, mapping: Dict[str, str], swap_ratio: float = 0.67) -> None:
+    def __init__(self, mapping: Dict[str, str], swap_ratio: float = 0.33) -> None:
         if not 0.0 <= swap_ratio <= 1.0:
             raise ValueError(f"swap_ratio は 0.0〜1.0 で指定してください: {swap_ratio}")
         fixed_points = sorted(src for src, dst in mapping.items() if src == dst)
@@ -192,11 +192,11 @@ class ConsonantSubstitutionTable:
         self.swap_ratio: float = swap_ratio
 
     @classmethod
-    def articulatory(cls, swap_ratio: float = 0.67) -> "ConsonantSubstitutionTable":
+    def articulatory(cls, swap_ratio: float = 0.33) -> "ConsonantSubstitutionTable":
         """調音様式・有声性を保ったまま調音点だけを変える置換表（k→t、n→m など）。
 
         「別の言語」ではなく「滑舌が悪い」側に寄るため、意味を壊しつつ聞き疲れしにくい。
-        実対話での聴取で swap_ratio=0.67 を選んだ。0.5 は分かりやすすぎて「わかりそうでわからない」にならなかった（詳細は DECISIONS.md）。
+既定は swap_ratio=0.33。0.5 → 0.67 → 0.5 と動かしたのち、**初めて聞く人には聞き取れない**という指摘で 0.33 まで下げた。開発者は応答の中身も置換規則も知っているため復元できてしまい、値を高く見積もる（経緯は DECISIONS.md）。
         """
         mapping = {}
         for group in ARTICULATION_GROUPS:
