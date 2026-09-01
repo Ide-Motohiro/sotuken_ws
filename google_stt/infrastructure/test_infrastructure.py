@@ -11,7 +11,7 @@ from google_stt.domain.models import (
 from google_stt.infrastructure.phoneme_swap import PhonemeSwapTTS, substitute_consonants
 from google_stt.infrastructure.filler import VoiceVoxFillerPlayer
 from google_stt.infrastructure.gemini import GeminiLanguageModel
-from google_stt.infrastructure.voicevox import SynthesisTiming, VoiceVoxTTS
+from google_stt.infrastructure.voicevox import SynthesisTiming, VoiceVoxTTS, check_server
 from google_stt.infrastructure.pseudo_voice import PseudoVoiceTTS
 from google_stt.infrastructure.google_stt import (
     INPUT_DEVICE_ENV_VAR, GoogleSpeechRecognizer, describe_input_device,
@@ -333,6 +333,20 @@ class TestVoiceVoxTimingIntegration(unittest.TestCase):
         self.assertIsNone(tts.last_timing)
 
 
+class TestVoiceVoxServerCheck(unittest.TestCase):
+    """起動確認。VOICEVOX を立ち上げ忘れたときに何が起きたか読み取れるようにするためのもの"""
+
+    def test_reports_a_readable_reason_when_the_server_is_down(self):
+        # 使われていないポートに向ける（接続拒否が返る）
+        problem = check_server("http://127.0.0.1:50099", timeout=1.0)
+        self.assertIsNotNone(problem)
+        self.assertIn("VOICEVOX", problem)
+
+    @unittest.skipUnless(is_voicevox_running(), "VOICEVOX server is not running")
+    def test_returns_none_when_the_server_is_up(self):
+        self.assertIsNone(check_server(VoiceVoxTTS.DEFAULT_URL))
+
+
 class TestVoiceVoxFillerPlayerSelection(unittest.TestCase):
     """フィラーの選択規則。連続するターンで同じ音が鳴らないことが要件"""
 
@@ -374,6 +388,56 @@ class TestVoiceVoxFillerPlayerSelection(unittest.TestCase):
     def test_rejects_negative_initial_delay(self):
         with self.assertRaises(ValueError):
             VoiceVoxFillerPlayer(VoiceVoxTTS(), phrases=("ん",), initial_delay_sec=-0.1)
+
+
+class TestVoiceVoxFillerPlayerSynthesis(unittest.TestCase):
+    """フィラーの事前合成に子音置換を通さないこと。
+
+    「感動詞は子音を持たないので壊れない」は「うーん」「あー」にしか当てはまらない。
+    「えーと」の `と` は子音を持ち、語ごとに合成するため通し番号0番になって必ず置換される。
+    """
+
+    @unittest.skipUnless(is_voicevox_running(), "VOICEVOX server is not running")
+    def test_synthesizer_bypasses_the_consonant_substitution(self):
+        plain = VoiceVoxTTS()
+        swapping = PhonemeSwapTTS()
+        player = VoiceVoxFillerPlayer(swapping, synthesizer=plain, phrases=("えーと",))
+        try:
+            with open(player._paths[0], "rb") as f:
+                produced = f.read()
+        finally:
+            player.close()
+        expected, _, _ = plain.synthesize("えーと")
+        swapped, _, _ = swapping.synthesize("えーと")
+        self.assertEqual(produced, expected)
+        self.assertNotEqual(produced, swapped, "「えーと」は置換を受けるはずで、比較の前提が崩れている")
+
+    @unittest.skipUnless(is_voicevox_running(), "VOICEVOX server is not running")
+    def test_falls_back_to_the_given_tts(self):
+        """synthesizer を省いたら従来どおり tts で合成すること"""
+        swapping = PhonemeSwapTTS()
+        player = VoiceVoxFillerPlayer(swapping, phrases=("えーと",))
+        try:
+            with open(player._paths[0], "rb") as f:
+                produced = f.read()
+        finally:
+            player.close()
+        swapped, _, _ = swapping.synthesize("えーと")
+        self.assertEqual(produced, swapped)
+
+    @unittest.skipUnless(is_voicevox_running(), "VOICEVOX server is not running")
+    def test_playback_still_marks_the_main_tts_as_speaking(self):
+        """合成を分けてもエコー防止は本体の tts 側で働くこと"""
+        swapping = PhonemeSwapTTS()
+        player = VoiceVoxFillerPlayer(
+            swapping, synthesizer=VoiceVoxTTS(), phrases=("あー",), initial_delay_sec=5.0)
+        try:
+            player.start()
+            self.assertTrue(swapping.is_speaking)
+            player.stop()
+            self.assertFalse(swapping.is_speaking)
+        finally:
+            player.close()
 
 
 class TestVoiceVoxFillerPlayerTiming(unittest.TestCase):

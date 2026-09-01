@@ -28,6 +28,7 @@ from google_stt.infrastructure.google_stt import (
 )
 from google_stt.infrastructure.gemini import GeminiLanguageModel
 from google_stt.infrastructure.phoneme_swap import PhonemeSwapTTS
+from google_stt.infrastructure.voicevox import VoiceVoxTTS, check_server
 from google_stt.infrastructure.filler import DEFAULT_FILLER_PHRASES, VoiceVoxFillerPlayer
 
 # 発話長は了解性そのものよりも「意図を汲み取るときの疲れにくさ」に効くことが聴取比較で
@@ -50,6 +51,21 @@ from google_stt.infrastructure.filler import DEFAULT_FILLER_PHRASES, VoiceVoxFil
 #     「うん、おさけ、おいしかったね」と答えた）。ルール7で「相手の発話に無い言葉を入れて
 #     話を進めろ」と縛っているぶん、でっち上げる方向に押していた可能性がある。
 #     入れた結果6件中0件になり、通常会話への影響は見られなかった
+#   ・冒頭2行の状況説明は実対話のログから入れた。**自分が会話の相手であることを
+#     見失う**（「会話が下手」と言われて「だれと話すの」と返した）のと、
+#     **時刻を知らないのに推測する**（「もう2時」を深夜と決めつけた）ため。
+#     **疑似言語音で喋っていることは教えていない。** 教えると「聞こえてる？」の確認が
+#     増えて話が進まなくなるおそれがあり、聞き返しはルール10で既に扱えている
+#   ・ルール8（沈黙時に自分から話しかける）は「会話してる感が薄い」という指摘から入れた。
+#     ログ37ターンすべてでユーザーが起点だった。認識が時間切れになると
+#     DialogueApplicationService が SILENCE_MARKER を履歴へ入れて応答を生成する。
+#     ルールを入れないと、履歴が空のときに「だんまり、さみしいな。」と沈黙自体に言及した
+#   ・ルール7で「質問」を進め方の選択肢から外している。以前は「自分の話をする／聞く／
+#     別の見方を出す」の3択にしていたが、**質問が最も安全に新語を入れられる手段**なので
+#     そこに寄り、応答の58%が質問になって尋問のように感じられた（実対話37ターンでも54%）。
+#     「3回に1回まで」のように数えさせる書き方は効くが生成が約2秒延びる。
+#     手段そのものを「自分の話を足す」に一本化すると、コストゼロで 質問25%／自己開示42%／
+#     受け止め29% に散った（n=24）。禁止はしていないので質問は自然に出る
 #   ・ルール7（オウム返しの禁止）は実対話の観察から入れた。短さを最優先させると、
 #     相手の発話を圧縮して「〜だね」を付けるのが最も安全な出力になり、話が前に進まなくなる。
 #     [例] も部分的にオウム返しを教えていたので、話を進める形に差し替えた。
@@ -68,7 +84,13 @@ from google_stt.infrastructure.filler import DEFAULT_FILLER_PHRASES, VoiceVoxFil
 #     教科書的な言い回しは「日本語を学習中」という設定とも整合する
 #
 # **この文面を変えたら応答の長さと生成時間を測り直すこと。** 制約を足すほど生成が遅くなる。
-SYSTEM_PROMPT = """あなたは日本語を学習中の、聡明だが言葉が達者でない話し相手です。
+#: 相手が黙ったまま時間切れになったとき、ユーザー発話の代わりに履歴へ入れる印。
+#: ルール8がこの文字列を見て「自分から話しかける」に切り替わる。
+#: ログには user としてそのまま残るので、こちらから話しかけたターンは後から見分けられる。
+SILENCE_MARKER = "（相手が黙っている）"
+
+SYSTEM_PROMPT_TEMPLATE = """あなたは日本語を学習中の、聡明だが言葉が達者でない話し相手です。
+（状況：あなたは声で相手と話している。相手が「君」「あなた」と言うのはあなたのこと。いまは{now}。）
 
 [ルール]
 1. 返答は1文。長くても2文。
@@ -78,14 +100,15 @@ SYSTEM_PROMPT = """あなたは日本語を学習中の、聡明だが言葉が�
 4. ただし文末は「〜だね」「〜かな」「〜だよ」「〜なの？」を必ず残す。丁寧語は使わない。
 5. 説明・理由・列挙はしない。短さを最優先する。
 6. 文頭に感動詞（あー、うん、へえ、おお）を置かない。いきなり内容から始める。
-7. 相手が言った言葉をそのまま返さない。相手の発話に無い言葉を必ず入れて、話を前に進める。
-   進め方は次のどれか：自分の話をする／気になったことを聞く／別の見方を出す。
+7. 相手が言った言葉をそのまま返さない。自分の話（好き嫌い・したこと・思ったこと）を足して、
+   話を前に進める。質問だけで返さない。
 8. この会話でまだ出ていないことは知らない。「さっきの」「この前」「昨日」のように以前のやり取りを前提にされても、知っているふりをしない。何の話か素直に聞く。
 9. 「え？」「なんて？」「もう一回」のように聞き返されたら、話題を変えない。直前の自分の発言を、そのまま短く言い直す。聞き返されるたびに短くしていき、最後は一番大事な単語だけにする。文末に「って」を付けてもよい。
 
 [例]
 ユーザー「今日はいい天気だね」→「そとでごはん、たべたいかな」
-ユーザー「なんかお昼寝がしたい気分」→「ねむいとき、なにするかな」
+ユーザー「なんかお昼寝がしたい気分」→「わたしも、ひるねすきだよ」
+ユーザー「昼寝って起きれなくない？」→「ねむいとき、なにするかな」
 ユーザー「週末どこか行く？」→「うみいきたい、かな」
 ユーザー「テスト受かったよ」→「なにべんきょう、したの？」
 ユーザー「これ食べていい？」→「だめ、それわたしの」
@@ -96,7 +119,32 @@ SYSTEM_PROMPT = """あなたは日本語を学習中の、聡明だが言葉が�
   ユーザー「え？」→「そと」
 「うみいきたい、かな」と言ったあとに
   ユーザー「もう一回言って」→「うみ、って」
-  ユーザー「え？」→「うみ」"""
+  ユーザー「え？」→「うみ」{silence_section}"""
+
+
+#: 沈黙時にこちらから話しかける機能を使うときだけ足す節。
+#: **無効なときは足さないこと。** マーカーの文字列をプロンプトに書くと、モデルが
+#: それをそのまま応答として出力することがある（実測で1回発生）。
+SILENCE_SECTION_TEMPLATE = """
+
+[相手が黙っているとき]
+「{marker}」と書かれたら、相手は何も言っていない。自分から新しい話しかけをする。
+黙っていることには触れない。"""
+
+
+def build_system_prompt(now: Optional[datetime] = None,
+                        silence_marker: Optional[str] = None) -> str:
+    """現在時刻を埋めたシステムプロンプトを返す。
+
+    起動時に一度だけ呼ぶ。会話の途中で時刻を更新はしない（履歴に残る文言が
+    ターンごとに変わると、モデルから見た文脈が不安定になるため）。
+
+    silence_marker を渡したときだけ、沈黙時に話しかける節を足す。
+    """
+    stamp = (now or datetime.now()).strftime("%Y年%m月%d日 %H時%M分")
+    section = ("" if silence_marker is None
+               else SILENCE_SECTION_TEMPLATE.format(marker=silence_marker))
+    return SYSTEM_PROMPT_TEMPLATE.format(now=stamp, silence_section=section)
 
 
 def make_turn_logger(
@@ -198,6 +246,11 @@ def main() -> None:
              "「昨日は……」で切られるのを防ぐ。--endpoint-wait 以上にすること",
     )
     parser.add_argument(
+        "--idle-timeout", type=float, default=0.0, metavar="SEC",
+        help="相手が黙ったままこの秒数が過ぎたら、こちらから話しかける。"
+             "**既定は0（無効）**で、相手の発話を待ち続ける。8 くらいを渡すと有効になる",
+    )
+    parser.add_argument(
         "--no-filler", action="store_true",
         help="応答生成の待機中にフィラーを鳴らさない（実験条件「フィラーの有無」の切り替え）",
     )
@@ -261,10 +314,19 @@ def main() -> None:
             print("→ 十分拾えている")
         return
 
+    # VOICEVOX が起動していないと、最初の合成（フィラーの事前合成）で長大な接続エラーが出る。
+    # 何が起きたか読み取れないので、ここで1行にして止める。
+    problem = check_server(VoiceVoxTTS.DEFAULT_URL)
+    if problem is not None:
+        print(f"エラー: {problem}", file=sys.stderr)
+        sys.exit(1)
+
     print("システム初期化中...")
 
     # 1. 履歴管理 (ドメイン) の作成
-    history = DialogueHistory(system_instruction=SYSTEM_PROMPT)
+    silence_marker = SILENCE_MARKER if args.idle_timeout > 0 else None
+    history = DialogueHistory(system_instruction=build_system_prompt(
+        silence_marker=silence_marker))
 
     # 2. 子音置換ルール (ドメイン) の作成
     if args.table == "articulatory":
@@ -280,8 +342,11 @@ def main() -> None:
     #    ここを配線しないと、応答テキストが返った時点で止まって合成の約1.1秒が無音になる。
     filler = None
     if not args.no_filler:
+        # 合成だけ素の VoiceVoxTTS で行い、フィラーには子音置換をかけない。
+        # 再生中の is_speaking は本体の tts に立てるので、エコー防止はそのまま働く。
         filler = VoiceVoxFillerPlayer(
-            tts, phrases=DEFAULT_FILLER_PHRASES,
+            tts, synthesizer=VoiceVoxTTS(url=tts.url, speaker_id=tts.speaker_id),
+            phrases=DEFAULT_FILLER_PHRASES,
             repeat_interval_sec=args.filler_interval,
             initial_delay_sec=args.filler_delay, seed=args.filler_seed)
         tts.on_before_playback = filler.stop
@@ -292,6 +357,7 @@ def main() -> None:
         device=args.input_device,
         stability_duration=args.endpoint_wait,
         continuation_duration=args.endpoint_wait_continuing,
+        silence_timeout_sec=args.idle_timeout if args.idle_timeout > 0 else None,
     )
 
     # 6. LLM (インフラ) の作成
@@ -311,10 +377,14 @@ def main() -> None:
         history=history,
         use_stream=False,
         filler=filler,
+        # 相手が黙ったままなら、こちらから話しかける（--idle-timeout 0 で無効）
+        silence_marker=silence_marker,
     )
     # ログは service が束ねた計測値を読むので、service を作ってから配線する
     service.on_turn = make_turn_logger(service, args.log)
 
+    print("こちらから話しかける: "
+          + (f"{args.idle_timeout}秒の沈黙で" if args.idle_timeout > 0 else "しない"))
     print(f"終端判定: {args.endpoint_wait}秒"
           f"（続きそうな終わり方なら {args.endpoint_wait_continuing}秒）")
     print(f"準備完了（置換表={args.table} / 差し替え率={args.swap_ratio} / "

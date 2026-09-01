@@ -131,6 +131,7 @@ class GoogleSpeechRecognizer(SpeechRecognizer):
         chunk_size: int = 1600,
         stability_duration: float = 0.4,
         continuation_duration: float = 1.0,
+        silence_timeout_sec: Optional[float] = None,
         is_speaking_fn = lambda: False,
         device: Optional[Union[int, str]] = None,
         announce_device: bool = True,
@@ -148,6 +149,10 @@ class GoogleSpeechRecognizer(SpeechRecognizer):
                 f"continuation_duration ({continuation_duration}) は "
                 f"stability_duration ({stability_duration}) 以上にすること")
         self.continuation_duration: float = continuation_duration
+        #: 何も認識しないままこの秒数が過ぎたら空文字を返して制御を戻す。
+        #: 相手が黙ったままのときにこちらから話しかけられるようにするための口。
+        #: None または 0以下 なら時間切れ無し（発話があるまで待ち続ける）。
+        self.silence_timeout_sec: Optional[float] = silence_timeout_sec
         self.is_speaking_fn = is_speaking_fn
         self.audio_queue: queue.Queue = queue.Queue()
 
@@ -206,6 +211,19 @@ class GoogleSpeechRecognizer(SpeechRecognizer):
         self.last_endpoint_wait_sec = None
         self.last_confidence = None
         self.last_finalized_by_service = None
+        self.last_timed_out = False
+
+        # 何も認識しないまま時間切れになったら、送信側を止めてストリームを畳む。
+        # 一度でも認識結果が届いたら取り消す（喋っている途中で切らないため）。
+        timed_out = threading.Event()
+        timeout_timer: Optional[threading.Timer] = None
+        if self.silence_timeout_sec and self.silence_timeout_sec > 0:
+            def on_timeout() -> None:
+                timed_out.set()
+                stop_streaming.set()
+            timeout_timer = threading.Timer(self.silence_timeout_sec, on_timeout)
+            timeout_timer.daemon = True
+            timeout_timer.start()
 
         def generate_requests():
             while not stop_streaming.is_set():
@@ -220,26 +238,36 @@ class GoogleSpeechRecognizer(SpeechRecognizer):
                             blocksize=self.chunk_size, callback=self._callback,
                             device=self.device):
             responses = self._stt_client.streaming_recognize(self._streaming_config, generate_requests())
-            for response in responses:
-                for result in response.results:
-                    alternative = result.alternatives[0]
-                    transcript = alternative.transcript
-                    now = time.monotonic()
-                    if result.is_final:
-                        # 認識サービス側が確定と判断した経路。信頼度はここにしか入らない
-                        self._record_endpoint(now, stable_since, alternative, by_service=True)
-                        stop_streaming.set()
-                        return transcript
+            try:
+                for response in responses:
+                    for result in response.results:
+                        alternative = result.alternatives[0]
+                        transcript = alternative.transcript
+                        now = time.monotonic()
+                        if transcript and timeout_timer is not None:
+                            timeout_timer.cancel()   # 喋り始めたので時間切れは取り消す
+                            timeout_timer = None
+                        if result.is_final:
+                            # 認識サービス側が確定と判断した経路。信頼度はここにしか入らない
+                            self._record_endpoint(now, stable_since, alternative, by_service=True)
+                            stop_streaming.set()
+                            return transcript
 
-                    if transcript != last_interim:
-                        last_interim = transcript
-                        stable_since = now
-                    elif transcript and (now - stable_since) >= self.required_stability(transcript):
-                        # 中間結果が変化しなくなった経路。本システムでは主にこちらが効く
-                        self._record_endpoint(now, stable_since, alternative, by_service=False)
-                        stop_streaming.set()
-                        return transcript
-                    print(f"\r途中: {transcript}", end="", flush=True)
+                        if transcript != last_interim:
+                            last_interim = transcript
+                            stable_since = now
+                        elif transcript and (now - stable_since) >= self.required_stability(transcript):
+                            # 中間結果が変化しなくなった経路。本システムでは主にこちらが効く
+                            self._record_endpoint(now, stable_since, alternative, by_service=False)
+                            stop_streaming.set()
+                            return transcript
+                        print(f"\r途中: {transcript}", end="", flush=True)
+            finally:
+                if timeout_timer is not None:
+                    timeout_timer.cancel()
+        # ここに来るのは、何も認識しないままストリームが終わったとき。
+        # 時間切れによるものかどうかを残す（相手が黙っているのかの判断に使う）
+        self.last_timed_out = timed_out.is_set()
         return ""
 
     def _record_endpoint(self, now: float, stable_since: float, alternative,

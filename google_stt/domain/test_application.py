@@ -154,6 +154,68 @@ class RecordingTextToSpeech(MockTextToSpeech):
         self.spoken_texts.append(text)
 
 
+class TestDialogueApplicationServiceSpeakUp(unittest.TestCase):
+    """相手が黙ったままのとき、こちらから話しかけること。
+
+    ログ37ターンすべてでユーザーが起点だったため入れた機構。認識器が時間切れを
+    知らせてきたときだけ働き、続けて話し続けないことが要件。
+    """
+
+    MARKER = "（相手が黙っている）"
+
+    def _service(self, recognized, timed_out, filler=None, marker=MARKER, max_idle=1):
+        recognizer = MockSpeechRecognizer(recognized)
+        recognizer.last_timed_out = timed_out
+        tts = MockTextToSpeech()
+        return DialogueApplicationService(
+            recognizer=recognizer, model=MockLanguageModel(reply="うみ、すきだよ"),
+            tts=tts, history=DialogueHistory(), use_stream=False,
+            silence_marker=marker, max_idle_utterances=max_idle, filler=filler,
+        ), tts
+
+    def test_speaks_up_when_recognition_times_out(self):
+        service, tts = self._service([""], timed_out=True)
+        service.run_once()
+        self.assertEqual(tts.spoken_texts, ["うみ、すきだよ"])
+        # 印はユーザー発話として履歴に残る（ログから話しかけたターンを見分けるため）
+        texts = [m.text for m in service.history.get_messages()]
+        self.assertEqual(texts, [self.MARKER, "うみ、すきだよ"])
+
+    def test_stays_silent_when_nothing_was_recognized_without_timeout(self):
+        """認識が空でも時間切れでなければ話しかけない（雑音を拾っただけの場合など）"""
+        service, tts = self._service([""], timed_out=False)
+        service.run_once()
+        self.assertEqual(tts.spoken_texts, [])
+        self.assertEqual(service.history.get_messages(), [])
+
+    def test_disabled_when_no_marker_is_given(self):
+        """silence_marker=None なら従来どおり待ち続ける"""
+        service, tts = self._service([""], timed_out=True, marker=None)
+        service.run_once()
+        self.assertEqual(tts.spoken_texts, [])
+
+    def test_does_not_keep_talking_to_a_silent_partner(self):
+        """相手の発話を挟まずに続けて話しかけないこと（席を外している場合の暴走防止）"""
+        service, tts = self._service(["", "", ""], timed_out=True)
+        for _ in range(3):
+            service.run_once()
+        self.assertEqual(len(tts.spoken_texts), 1)
+
+    def test_user_speech_allows_speaking_up_again(self):
+        """相手が一度でも喋れば、また話しかけられるようになること"""
+        service, tts = self._service(["", "こんにちは", ""], timed_out=True)
+        for _ in range(3):
+            service.run_once()
+        self.assertEqual(len(tts.spoken_texts), 3)   # 話しかけ → 応答 → 話しかけ
+
+    def test_filler_is_not_played_when_speaking_up(self):
+        """フィラーは鳴らさないこと。相手の発話が無い経路で鳴らすと回数が条件間でぶれる"""
+        filler = MockFillerPlayer()
+        service, _ = self._service([""], timed_out=True, filler=filler)
+        service.run_once()
+        self.assertEqual(filler.events, [])
+
+
 class TestDialogueApplicationServiceTiming(unittest.TestCase):
     """区間ごとの計測値を1ターンぶんに束ねること。
 

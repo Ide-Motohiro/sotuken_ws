@@ -51,8 +51,13 @@ import winsound
 from google_stt.domain.interfaces import FillerPlayer
 from google_stt.infrastructure.voicevox import VoiceVoxTTS
 
-#: 既定のフィラー。いずれも母音・撥音・長音に偏っており、子音置換方式では
-#: ほとんど加工を受けないため、疑似言語音でもフィラーとして機能する。
+#: 既定のフィラー。
+#:
+#: **子音置換は通さない**（`synthesizer` に素の VoiceVoxTTS を渡す）。
+#: 「感動詞は子音を持たないので壊れない」と考えていたが、これが成り立つのは
+#: 「うーん」「あー」だけだった。「えーと」の `と`、「あのー」の `の` は子音を持つ。
+#: しかも語ごとに別々に合成するため、その子音は必ず通し番号0番になり、
+#: `should_swap(0)` が常に真を返す。**差し替え率によらず必ず変換されていた**。
 #:
 #: 選択は無作為だが直前と同じものは選ばないので、連続するターンで同じ音は鳴らない
 #: （選択状態はターンをまたいで保持される）。
@@ -70,6 +75,7 @@ class VoiceVoxFillerPlayer(FillerPlayer):
         self,
         tts: VoiceVoxTTS,
         phrases: Sequence[str] = DEFAULT_FILLER_PHRASES,
+        synthesizer: Optional[VoiceVoxTTS] = None,
         repeat_interval_sec: float = 2.0,
         initial_delay_sec: float = 0.4,
         seed: Optional[int] = None,
@@ -79,6 +85,9 @@ class VoiceVoxFillerPlayer(FillerPlayer):
         if initial_delay_sec < 0.0:
             raise ValueError(f"立ち上がりの遅延が負です: {initial_delay_sec}")
         self.tts: VoiceVoxTTS = tts
+        #: 事前合成にだけ使う TTS。再生中の is_speaking は tts 側に立てる。
+        #: **疑似言語音の子音置換を避けるために分けてある。** 省略すると tts をそのまま使う。
+        self.synthesizer: VoiceVoxTTS = synthesizer if synthesizer is not None else tts
         self.phrases: List[str] = list(phrases)
         self.repeat_interval_sec: float = repeat_interval_sec
         #: start() から1つ目を鳴らし始めるまでの待ち。0 にすると認識確定と同時に鳴る
@@ -94,7 +103,7 @@ class VoiceVoxFillerPlayer(FillerPlayer):
         # 起動時に全パターンを合成して一時ファイル化する（再生時に合成しないため）
         self._paths: List[str] = []
         for phrase in self.phrases:
-            wav_bytes, _, _ = tts.synthesize(phrase)
+            wav_bytes, _, _ = self.synthesizer.synthesize(phrase)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 f.write(wav_bytes)
                 self._paths.append(f.name)

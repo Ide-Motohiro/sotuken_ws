@@ -33,15 +33,34 @@ class SynthesisTiming:
         return self.query_sec + self.synthesis_sec + self.playback_sec
 
 
+def check_server(url: str, timeout: float = 3.0) -> Optional[str]:
+    """VOICEVOX が起動しているか確かめる。起動していれば None、していなければ理由を返す。
+
+    起動を忘れたときに出るのは requests の接続エラーで、100行近いトレースバックの末尾に
+    ようやく理由が出る。何が起きたのか読み取れないので、起動時に1行で伝える。
+    例外は握りつぶさず、呼び出し側が終了コードを決められるよう文字列で返す。
+    """
+    try:
+        response = requests.get(f"{url}/version", timeout=timeout)
+        response.raise_for_status()
+        return None
+    except requests.exceptions.ConnectionError:
+        return f"{url} に接続できません。VOICEVOX を起動してください。"
+    except requests.exceptions.RequestException as e:
+        return f"{url} への接続に失敗しました: {type(e).__name__}: {e}"
+
+
 class VoiceVoxTTS(TextToSpeech):
     """VOICEVOX サーバーを用いた音声合成・再生の具象実装"""
 
-    # "localhost" はこの環境では ::1（IPv6）を先に返し、VOICEVOX が IPv6 で待ち受けて
-    # いないため、TCP接続のたびに約2秒のフォールバック待ちが入る
-    # （measure_voicevox_latency.py で実測）。体感レイテンシに直接効くので 127.0.0.1 を既定にする。
+    #: "localhost" はこの環境では ::1（IPv6）を先に返し、VOICEVOX が IPv6 で待ち受けて
+    #: いないため、TCP接続のたびに約2秒のフォールバック待ちが入る
+    #: （measure_voicevox_latency.py で実測）。体感レイテンシに直接効くので 127.0.0.1 を既定にする。
+    DEFAULT_URL = "http://127.0.0.1:50021"
+
     def __init__(
         self,
-        url: str = "http://127.0.0.1:50021",
+        url: str = DEFAULT_URL,
         speaker_id: int = 3,
         on_timing: Optional[Callable[[SynthesisTiming], None]] = None,
         on_before_playback: Optional[Callable[[], None]] = None,

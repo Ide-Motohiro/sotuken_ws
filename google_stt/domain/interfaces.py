@@ -11,6 +11,11 @@ class SpeechRecognizer(ABC):
 
     #: 直近の認識結果に付いていた信頼度。取れない実装・経路では None のまま。
     last_confidence: Optional[float] = None
+
+    #: 直近の recognize_once() が、何も認識しないまま時間切れで返ったか。
+    #: 相手が黙ったままであることの合図で、こちらから話しかける判断に使う。
+    #: 時間切れを実装しない場合は常に False。
+    last_timed_out: bool = False
     
     @abstractmethod
     def recognize_once(self) -> str:

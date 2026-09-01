@@ -14,10 +14,20 @@ class DialogueApplicationService:
         tts: TextToSpeech,
         history: DialogueHistory,
         use_stream: bool = True,
+        silence_marker: Optional[str] = None,
+        max_idle_utterances: int = 1,
         on_turn: Optional[Callable[[str, str], None]] = None,
         filler: Optional[FillerPlayer] = None
     ) -> None:
         """
+        silence_marker: 相手が黙ったまま時間切れになったときに、履歴へ入れる印。
+            None なら何もせず次の認識へ戻る（従来どおり、常に相手の発話を待つ）。
+            文字列を渡すと、それをユーザー発話として履歴に入れて応答を生成し、
+            **こちらから話しかける**。認識器が `last_timed_out` を立てる実装でないと働かない。
+
+        max_idle_utterances: 相手の発話を挟まずに続けて話しかける回数の上限。
+            既定1。相手が席を外しているときに延々と喋り続けるのを防ぐ。
+
         filler: 応答生成の待機中にフィラーを鳴らす実装。None ならフィラー無し
             （これが実験条件「フィラーの有無」の切り替えになる）。
 
@@ -40,6 +50,10 @@ class DialogueApplicationService:
         self.use_stream: bool = use_stream
         self.on_turn: Optional[Callable[[str, str], None]] = on_turn
         self.filler: Optional[FillerPlayer] = filler
+        self.silence_marker: Optional[str] = silence_marker
+        self.max_idle_utterances: int = max_idle_utterances
+        #: 相手の発話を挟まずに続けて話しかけた回数
+        self._idle_utterances: int = 0
         #: 直近のターンの時間の内訳。各実装が測った値を束ねたもの。
         #: on_turn が呼ばれる時点では既に入っているので、ログ側はここを読めばよい。
         self.last_turn_timing: Optional[TurnTiming] = None
@@ -57,7 +71,11 @@ class DialogueApplicationService:
         stripped_user_text = user_text.strip() if user_text else ""
 
         if not stripped_user_text:
+            if self._should_speak_up():
+                self._speak_up()
             return
+
+        self._idle_utterances = 0
 
         self.history.add_user_message(stripped_user_text)
 
@@ -75,6 +93,26 @@ class DialogueApplicationService:
 
         if self.on_turn is not None:
             self.on_turn(stripped_user_text, reply_text)
+
+    def _should_speak_up(self) -> bool:
+        """相手が黙ったままなので、こちらから話しかけるべきかを判断する"""
+        return (self.silence_marker is not None
+                and self.recognizer.last_timed_out
+                and self._idle_utterances < self.max_idle_utterances)
+
+    def _speak_up(self) -> None:
+        """相手が黙ったままのとき、こちらから話しかける。
+
+        **フィラーは鳴らさない。** フィラーは「相手が喋り終わってから応答が出るまで」を
+        埋めるものなので、相手の発話が無いこの経路で鳴らすと、フィラーの回数が
+        相手の黙り方に左右されることになり、実験条件（フィラーの有無）の交絡になる。
+        """
+        self._idle_utterances += 1
+        self.history.add_user_message(self.silence_marker)
+        reply_text = self._generate_and_speak()
+        self.last_turn_timing = self._collect_timing()
+        if self.on_turn is not None:
+            self.on_turn(self.silence_marker, reply_text)
 
     def _collect_timing(self) -> TurnTiming:
         """各実装が測った区間を1つに束ねる。測っていない実装では None が入る。
