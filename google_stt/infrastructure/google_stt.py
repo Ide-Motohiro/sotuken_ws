@@ -132,6 +132,7 @@ class GoogleSpeechRecognizer(SpeechRecognizer):
         stability_duration: float = 0.4,
         continuation_duration: float = 1.0,
         silence_timeout_sec: Optional[float] = None,
+        push_to_talk: bool = False,
         is_speaking_fn = lambda: False,
         device: Optional[Union[int, str]] = None,
         announce_device: bool = True,
@@ -153,6 +154,17 @@ class GoogleSpeechRecognizer(SpeechRecognizer):
         #: 相手が黙ったままのときにこちらから話しかけられるようにするための口。
         #: None または 0以下 なら時間切れ無し（発話があるまで待ち続ける）。
         self.silence_timeout_sec: Optional[float] = silence_timeout_sec
+        #: True なら、キーを押している間だけマイクを開く（手押しトリガー）。
+        #: 終端はキーを離した時刻そのものになるので、stability_duration も
+        #: continuation_duration も使われない。周りの声を拾う経路も閉じる。
+        self.push_to_talk: bool = push_to_talk
+        #: 押している間だけ録音するキー。pynput のキー定数を差し替えれば変えられる。
+        #: 将来ぬいぐるみ側の物理ボタンに置き換えるなら、この2つを差し替える。
+        self.push_to_talk_key = None
+        self.push_to_talk_label: str = "スペース"
+        if push_to_talk:
+            from pynput import keyboard
+            self.push_to_talk_key = keyboard.Key.space
         self.is_speaking_fn = is_speaking_fn
         self.audio_queue: queue.Queue = queue.Queue()
 
@@ -196,7 +208,12 @@ class GoogleSpeechRecognizer(SpeechRecognizer):
 
         確定条件は「中間結果が一定時間変化しないこと」。必要な時間は終わり方で変わり、
         まだ続きそうなら continuation_duration、そうでなければ stability_duration。
+
+        push_to_talk が真のときは、キーを押している間だけ録音して離した時点で確定する。
         """
+        if self.push_to_talk:
+            return self._recognize_while_held()
+
         # 前の発話で残った古いキューをクリア
         while not self.audio_queue.empty():
             try:
@@ -269,6 +286,91 @@ class GoogleSpeechRecognizer(SpeechRecognizer):
         # 時間切れによるものかどうかを残す（相手が黙っているのかの判断に使う）
         self.last_timed_out = timed_out.is_set()
         return ""
+
+    @staticmethod
+    def assemble_transcript(finals, interim: str) -> str:
+        """確定した断片と、確定していない途中結果をつないで1つの発話にする。
+
+        押しっぱなしの間に認識サービスが複数回確定させることがあるため、
+        最後の1つだけを採ると前半が落ちる。
+        """
+        return "".join(finals) + interim
+
+    def _recognize_while_held(self) -> str:
+        """キーを押している間だけ録音し、離したら確定して返す（手押しトリガー）。
+
+        終端の判定を人が行うので、中間結果の無変化を待つ必要が無い。
+        待ち時間が消えるだけでなく、**押していない間はマイクを開かないので
+        周りの声を拾わない**。騒がしい場所での実演を想定している。
+        """
+        from pynput import keyboard
+
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        self.last_endpoint_wait_sec = None
+        self.last_confidence = None
+        self.last_finalized_by_service = None
+        self.last_timed_out = False
+
+        stop_streaming = threading.Event()
+        pressed = threading.Event()
+        released_at = []
+
+        def on_press(key):
+            if key == self.push_to_talk_key:
+                pressed.set()
+
+        def on_release(key):
+            if key == self.push_to_talk_key and pressed.is_set():
+                released_at.append(time.monotonic())
+                stop_streaming.set()
+                return False   # 離したら監視を終える
+
+        def generate_requests():
+            while not stop_streaming.is_set():
+                try:
+                    chunk = self.audio_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                yield speech.StreamingRecognizeRequest(audio_content=chunk)
+
+        listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        listener.start()
+        finals = []
+        interim = ""
+        try:
+            print(f"  [{self.push_to_talk_label}を押しながら話す]", end="", flush=True)
+            pressed.wait()          # 押されるまでマイクを開かない
+            print("\r  [録音中... 離すと確定]      ", end="", flush=True)
+            with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype="int16",
+                                blocksize=self.chunk_size, callback=self._callback,
+                                device=self.device):
+                responses = self._stt_client.streaming_recognize(
+                    self._streaming_config, generate_requests())
+                for response in responses:
+                    for result in response.results:
+                        alternative = result.alternatives[0]
+                        if result.is_final:
+                            finals.append(alternative.transcript)
+                            interim = ""
+                            self.last_confidence = getattr(alternative, "confidence", None)
+                        else:
+                            interim = alternative.transcript
+                        print(f"\r  途中: {self.assemble_transcript(finals, interim)}",
+                              end="", flush=True)
+            # 終端はキーを離した時刻そのもの。ここに残すのは「離してから認識結果が
+            # 出そろうまで」で、中間結果の無変化を待つ経路の待ち時間に相当する。
+            if released_at:
+                self.last_endpoint_wait_sec = max(0.0, time.monotonic() - released_at[0])
+        finally:
+            listener.stop()
+            print()
+        return self.assemble_transcript(finals, interim).strip()
+
 
     def _record_endpoint(self, now: float, stable_since: float, alternative,
                          by_service: bool) -> None:

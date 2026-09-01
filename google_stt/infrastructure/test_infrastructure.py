@@ -543,6 +543,32 @@ class TestEndpointStability(unittest.TestCase):
                                    announce_device=False)
 
 
+class TestPushToTalkAssembly(unittest.TestCase):
+    """押しっぱなしの間に確定した断片をつなぐこと。
+
+    認識サービスは長い発話を複数回に分けて確定させるので、最後の1つだけを
+    採ると前半が落ちる。
+    """
+
+    def test_joins_finals_and_the_pending_interim(self):
+        self.assertEqual(
+            GoogleSpeechRecognizer.assemble_transcript(["こんにちは"], "げんき"),
+            "こんにちはげんき")
+
+    def test_joins_multiple_finals(self):
+        self.assertEqual(
+            GoogleSpeechRecognizer.assemble_transcript(["きょうは", "いい"], "てんき"),
+            "きょうはいいてんき")
+
+    def test_empty_input_gives_an_empty_transcript(self):
+        self.assertEqual(GoogleSpeechRecognizer.assemble_transcript([], ""), "")
+
+    def test_finals_alone_are_enough(self):
+        """離した時点で確定済みなら、途中結果は空でよい"""
+        self.assertEqual(
+            GoogleSpeechRecognizer.assemble_transcript(["こんにちは"], ""), "こんにちは")
+
+
 class TestInputDeviceResolution(unittest.TestCase):
     """マイク入力デバイスの指定解決。実機のデバイス構成に依存しないよう、
     実際に存在するデバイスを引いてから検証する"""

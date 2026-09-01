@@ -236,6 +236,12 @@ def main() -> None:
              "選択を間違えると認識が例外も出さずに返ってこないので、実験前に必ず通すこと",
     )
     parser.add_argument(
+        "--push-to-talk", action="store_true",
+        help="スペースを押している間だけマイクを開く。離した時点で発話終端とする。"
+             "終端判定の待ち（約1秒）が消え、押していない間は周りの声を拾わない。"
+             "騒がしい場所での実演向け。--endpoint-wait 系は使われなくなる",
+    )
+    parser.add_argument(
         "--endpoint-wait", type=float, default=0.4, metavar="SEC",
         help="発話終端とみなすまでの無音時間（既定0.4秒）。"
              "**フィラーが鳴り始める前の区間なので、伸ばすと隠せない無音がそのまま増える**",
@@ -358,6 +364,7 @@ def main() -> None:
         stability_duration=args.endpoint_wait,
         continuation_duration=args.endpoint_wait_continuing,
         silence_timeout_sec=args.idle_timeout if args.idle_timeout > 0 else None,
+        push_to_talk=args.push_to_talk,
     )
 
     # 6. LLM (インフラ) の作成
@@ -385,8 +392,11 @@ def main() -> None:
 
     print("こちらから話しかける: "
           + (f"{args.idle_timeout}秒の沈黙で" if args.idle_timeout > 0 else "しない"))
-    print(f"終端判定: {args.endpoint_wait}秒"
-          f"（続きそうな終わり方なら {args.endpoint_wait_continuing}秒）")
+    if args.push_to_talk:
+        print("終端判定: 手押しトリガー（スペースを押している間だけ録音）")
+    else:
+        print(f"終端判定: {args.endpoint_wait}秒"
+              f"（続きそうな終わり方なら {args.endpoint_wait_continuing}秒）")
     print(f"準備完了（置換表={args.table} / 差し替え率={args.swap_ratio} / "
           f"thinking={args.thinking_budget} / "
           f"フィラー={'なし' if args.no_filler else f'あり（{args.filler_delay}秒後）'}）。")
