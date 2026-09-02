@@ -344,7 +344,11 @@ class GoogleSpeechRecognizer(SpeechRecognizer):
         interim = ""
         try:
             print(f"  [{self.push_to_talk_label}を押しながら話す]", end="", flush=True)
-            pressed.wait()          # 押されるまでマイクを開かない
+            # 押されるまでマイクを開かない。**待ちは必ず区切ること。**
+            # 引数なしの wait() だとインタプリタに制御が戻らず、
+            # 押すまで Ctrl+C が効かなくなる（Windows で確認）。
+            while not pressed.wait(0.1):
+                pass
             print("\r  [録音中... 離すと確定]      ", end="", flush=True)
             with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype="int16",
                                 blocksize=self.chunk_size, callback=self._callback,
@@ -362,8 +366,10 @@ class GoogleSpeechRecognizer(SpeechRecognizer):
                             interim = alternative.transcript
                         print(f"\r  途中: {self.assemble_transcript(finals, interim)}",
                               end="", flush=True)
-            # 終端はキーを離した時刻そのもの。ここに残すのは「離してから認識結果が
-            # 出そろうまで」で、中間結果の無変化を待つ経路の待ち時間に相当する。
+            # 終端はキーを離した時刻そのものなので、判定の待ちは存在しない。
+            # ここに残すのは「離してから認識結果が出そろうまで」＝認識サービスの応答待ち。
+            # **中間結果の無変化を待つ経路の値とは意味が違う**ので、
+            # ログの push_to_talk と併せて読むこと。
             if released_at:
                 self.last_endpoint_wait_sec = max(0.0, time.monotonic() - released_at[0])
         finally:

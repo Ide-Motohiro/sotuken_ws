@@ -161,8 +161,10 @@ def make_turn_logger(
         print(f"  応答: {reply_text}")
         turn = service.last_turn_timing
         if turn is not None and turn.time_to_response_sec is not None:
+            # 手押しでは「終端判定の待ち」ではなく「キーを離してから認識が返るまで」
+            head = "認識待ち" if service.recognizer.push_to_talk else "終端判定"
             print(f"  応答まで {turn.time_to_response_sec:.2f}秒"
-                  f"（終端判定 {turn.endpoint_wait_sec:.2f} / 生成 {turn.generation_sec:.2f} / "
+                  f"（{head} {turn.endpoint_wait_sec:.2f} / 生成 {turn.generation_sec:.2f} / "
                   f"合成 {turn.time_to_first_sound_sec:.2f}"
                   + (f" / フィラー待ち {turn.filler_stop_delay_sec:.2f}"
                      if turn.filler_stop_delay_sec else "") + "）")
@@ -182,7 +184,8 @@ def make_turn_logger(
             "query_sec": rounded(synthesis.query_sec) if synthesis else None,
             "synthesis_sec": rounded(synthesis.synthesis_sec) if synthesis else None,
             # 発話終端からの通し。**endpoint_wait_sec の起点は中間結果が変化しなくなった
-            # 時刻であって、ユーザーが口を閉じた時刻ではない**（認識結果の遅れは未計測）
+            # 時刻であって、ユーザーが口を閉じた時刻ではない**（認識結果の遅れは未計測）。
+            # 手押しトリガーのときだけ起点が変わり、「キーを離した時刻」からの実測になる
             "endpoint_wait_sec": rounded(turn.endpoint_wait_sec) if turn else None,
             "generation_sec": rounded(turn.generation_sec) if turn else None,
             "time_to_first_sound_sec": rounded(turn.time_to_first_sound_sec) if turn else None,
@@ -196,6 +199,8 @@ def make_turn_logger(
             # 中間結果で確定した経路（finalized_by_service=false）では 0.0 になる想定
             # 差し替え率は聞き取りやすさのつまみ。条件を変えて話した記録が混ざるので毎ターン残す
             "swap_ratio": service.tts.substitution_table.swap_ratio,
+            # 終端の取り方。endpoint_wait_sec の意味が変わるので記録しておく
+            "push_to_talk": service.recognizer.push_to_talk,
             # このターンの時点で履歴に積まれている発話数。**起動直後の1ターン目は必ず2になる**
             # （このターンのユーザー発話＋応答）。履歴は保存されず毎回空から始まることの確認用
             "history_turns": len(service.history.get_messages()),

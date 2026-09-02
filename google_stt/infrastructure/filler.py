@@ -147,7 +147,9 @@ class VoiceVoxFillerPlayer(FillerPlayer):
             return
         started = time.perf_counter()
         self._stop_event.set()
-        self._thread.join()
+        # 区切って待つ。引数なしの join() だと鳴り終わるまで Ctrl+C が効かない
+        while self._thread.is_alive():
+            self._thread.join(0.1)
         self.last_stop_delay_sec = time.perf_counter() - started
         self._thread = None
         self._stop_event = None
